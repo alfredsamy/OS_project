@@ -62,6 +62,7 @@ static void kernel_thread(thread_func *, void *aux);
 static void idle(void *aux UNUSED);
 static struct thread *running_thread(void);
 static struct thread *next_thread_to_run(void);
+static struct thread *check_next_thread_to_run(void);
 static void init_thread(struct thread *, const char *name, int priority);
 static bool is_thread(struct thread *) UNUSED;
 static void *alloc_frame(struct thread *, size_t size);
@@ -135,6 +136,26 @@ void thread_tick(void) {
 void thread_print_stats(void) {
 	printf("Thread: %lld idle ticks, %lld kernel ticks, %lld user ticks\n",
 			idle_ticks, kernel_ticks, user_ticks);
+}
+
+/*true if a.priority < b.priority */bool less(const struct list_elem *a,
+		const struct list_elem *b, void *aux) {
+	struct thread *t1 = list_entry (a, struct thread, elem);
+	struct thread *t2 = list_entry (b, struct thread, elem);
+	if (t1->priority < t2->priority)
+		return true;
+	else
+		return false;
+}
+
+/*true if a.priority > b.priority */bool more(const struct list_elem *a,
+		const struct list_elem *b, void *aux) {
+	struct thread *t1 = list_entry (a, struct thread, elem);
+	struct thread *t2 = list_entry (b, struct thread, elem);
+	if (t1->priority > t2->priority)
+		return true;
+	else
+		return false;
 }
 
 /* Creates a new kernel thread named NAME with the given initial
@@ -229,8 +250,15 @@ void thread_unblock(struct thread *t) {
 
 	old_level = intr_disable();
 	ASSERT(t->status == THREAD_BLOCKED);
-	list_push_back(&ready_list, &t->elem);
+	//list_push_back (&ready_list, &t->elem);
+	list_insert_ordered(&ready_list, &t->elem, more, NULL);
 	t->status = THREAD_READY;
+	//printf("unblocking %s %d %d\n",t->name,t->priority,thread_get_priority());
+	if (t->priority > thread_get_priority()
+			&& thread_current() != idle_thread) {
+		//printf("%s-->%s\n",thread_name(),t->name);
+		thread_yield();
+	}
 	intr_set_level(old_level);
 }
 
@@ -291,10 +319,14 @@ void thread_yield(void) {
 	ASSERT(!intr_context ());
 
 	old_level = intr_disable();
-	if (cur != idle_thread)
-		list_push_back(&ready_list, &cur->elem);
+	if (cur != idle_thread) {
+		//list_push_back (&ready_list, &cur->elem);
+		//printf("*******listing %s\n",cur->name);
+		list_insert_ordered(&ready_list, &cur->elem, more, NULL);
+	}
 	cur->status = THREAD_READY;
 	schedule();
+	//printf("******run %s\n",thread_name());
 	intr_set_level(old_level);
 }
 
@@ -315,8 +347,30 @@ void thread_foreach(thread_action_func *func, void *aux) {
 /* Sets the current thread's priority to NEW_PRIORITY. */
 void thread_set_priority(int new_priority) {
 	thread_current()->priority = new_priority;
+	thread_current()->initial_priority = new_priority;
+	struct thread *t = check_next_thread_to_run();
+	if (thread_get_priority() < t->priority
+			&& thread_current() != idle_thread) {
+		//printf("%s-->%s\n",thread_name(),t->name);
+		thread_yield();
+	}
 }
 
+void thread_donate_priority(int new_priority) {
+	thread_current()->priority = new_priority;
+	struct thread *t = check_next_thread_to_run();
+	if (thread_get_priority() < t->priority
+			&& thread_current() != idle_thread) {
+		//printf("%s-->%s\n",thread_name(),t->name);
+		thread_yield();
+	}
+}
+
+void thread_reset_priority() {
+	thread_current()->donate = 0;
+	int initial = thread_current()->initial_priority;
+	thread_current()->priority = initial;
+}
 /* Returns the current thread's priority. */
 int thread_get_priority(void) {
 	return thread_current()->priority;
@@ -419,8 +473,11 @@ static void init_thread(struct thread *t, const char *name, int priority) {
 	strlcpy(t->name, name, sizeof t->name);
 	t->stack = (uint8_t *) t + PGSIZE;
 	t->priority = priority;
+	t->initial_priority = priority;
+	t->donate = 0;
 	t->magic = THREAD_MAGIC;
-	list_push_back(&all_list, &t->allelem);
+	//list_push_back (&all_list, &t->allelem);
+	list_insert_ordered(&all_list, &t->allelem, more, NULL);
 }
 
 /* Allocates a SIZE-byte frame at the top of thread T's stack and
@@ -448,6 +505,16 @@ next_thread_to_run(void) {
 		return list_entry (list_pop_front (&ready_list), struct thread, elem);
 }
 
+static struct thread *
+check_next_thread_to_run(void) {
+	if (list_empty(&ready_list))
+		return idle_thread;
+	else
+		return list_entry (list_front (&ready_list), struct thread, elem);
+}
+void donate(struct thread *t, int d) {
+	t->donate = d;
+}
 /* Completes a thread switch by activating the new thread's page
  tables, and, if the previous thread is dying, destroying it.
 
@@ -507,10 +574,13 @@ static void schedule(void) {
 	ASSERT(intr_get_level () == INTR_OFF);
 	ASSERT(cur->status != THREAD_RUNNING);
 	ASSERT(is_thread (next));
-
 	if (cur != next)
 		prev = switch_threads(cur, next);
 	thread_schedule_tail(prev);
+	if (thread_current()->donate != 0) {
+		if (thread_current()->donate > thread_get_priority())
+			thread_donate_priority(thread_current()->donate);
+	}
 }
 
 /* Returns a tid to use for a new thread. */
